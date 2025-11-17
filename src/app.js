@@ -9,6 +9,7 @@ const creditRoutes = require('./routes/creditRoutes');
 const callRoutes = require('./routes/callRoutes');
 const callHistoryRoutes = require('./routes/callHistoryRoutes');
 const contactRoutes = require('./routes/contactRoutes');
+const stripeRoutes = require('./routes/stripeRoutes');
 const errorHandler = require('./middleware/errorHandler');
 
 const app = express();
@@ -54,7 +55,10 @@ if (process.env.NODE_ENV === 'development') {
     app.use(morgan('dev'));
 }
 
-// Body parser
+// Stripe webhook route (must be before body parser - uses raw body)
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), require('./controllers/stripeController').handleWebhook);
+
+// Body parser (after Stripe webhook)
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -65,6 +69,8 @@ app.use('/api/credits', creditRoutes);
 app.use('/api/calls', callRoutes);
 app.use('/api/call-history', callHistoryRoutes);
 app.use('/api/contacts', contactRoutes);
+// Stripe routes (after body parser)
+app.use('/api/stripe', stripeRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

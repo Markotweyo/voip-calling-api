@@ -3,43 +3,54 @@ const Transaction = require('../models/Transaction');
 
 const CREDIT_PACKAGES = [{
         id: 'pkg_starter',
-        name: 'Starter Pack',
+        name: 'Starter',
         credits: 5.00,
         price: 5.00,
         bonus: 0,
         popular: false
     },
     {
+        id: 'pkg_basic',
+        name: 'Basic',
+        credits: 10.00,
+        price: 10.00,
+        bonus: 1.00,
+        popular: true
+    },
+    {
         id: 'pkg_popular',
-        name: 'Popular Pack',
+        name: 'Popular',
         credits: 25.00,
-        price: 20.00,
+        price: 25.00,
         bonus: 5.00,
-        popular: true,
-        savings: '20%'
+        popular: false
     },
     {
         id: 'pkg_pro',
-        name: 'Pro Pack',
+        name: 'Pro',
         credits: 50.00,
-        price: 35.00,
+        price: 50.00,
         bonus: 15.00,
-        popular: false,
-        savings: '30%'
+        popular: false
     },
     {
         id: 'pkg_enterprise',
-        name: 'Enterprise Pack',
+        name: 'Enterprise',
         credits: 100.00,
-        price: 60.00,
-        bonus: 40.00,
-        popular: false,
-        savings: '40%'
+        price: 100.00,
+        bonus: 35.00,
+        popular: false
     }
 ];
 
 exports.getBalance = async(req, res, next) => {
     try {
+        // Fetch recent transactions for the user
+        const transactions = await Transaction.find({ userId: req.user._id })
+            .sort({ createdAt: -1 })
+            .limit(20)
+            .lean();
+
         res.json({
             success: true,
             data: {
@@ -47,7 +58,8 @@ exports.getBalance = async(req, res, next) => {
                 currency: 'USD',
                 lastUpdated: new Date().toISOString(),
                 lowBalanceThreshold: 5.00,
-                isLowBalance: req.user.creditBalance < 5.00
+                isLowBalance: req.user.creditBalance < 5.00,
+                transactions
             }
         });
     } catch (error) {
