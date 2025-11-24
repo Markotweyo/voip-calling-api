@@ -4,9 +4,12 @@ const CallingRate = require('../models/CallingRate');
 const { parsePhoneNumber } = require('libphonenumber-js');
 
 const twilio = require('twilio');
+const { URL } = require('url');
 
 exports.getToken = async(req, res, next) => {
     try {
+        const requesterId = req.user && req.user._id ? req.user._id.toString() : 'unknown';
+        console.info('[API] /api/calls/token requested by user:', requesterId);
         const AccessToken = twilio.jwt.AccessToken;
         const VoiceGrant = AccessToken.VoiceGrant;
 
@@ -34,7 +37,9 @@ exports.getToken = async(req, res, next) => {
                 expiresAt: new Date(Date.now() + 3600000).toISOString()
             }
         });
+        console.info('[API] Twilio token issued for user:', requesterId);
     } catch (error) {
+        console.error('[API] Failed to issue Twilio token:', error);
         next(error);
     }
 };
@@ -60,15 +65,12 @@ exports.initiateCall = async(req, res, next) => {
             });
         }
 
-        // Initialize Twilio client
+        // Initialize Twilio client (REST)
         const client = twilio(
             process.env.TWILIO_ACCOUNT_SID,
             process.env.TWILIO_AUTH_TOKEN
         );
 
-        // Create a TwiML response
-        const twiml = new twilio.twiml.VoiceResponse();
-        twiml.dial({ callerId: from }, parsedNumber.format('E.164'));
         const rate = await CallingRate.findOne({
             countryCode: parsedNumber.country
         });
@@ -97,7 +99,7 @@ exports.initiateCall = async(req, res, next) => {
             });
         }
 
-        // Create call record
+        // Create call record (status will be updated by Twilio callbacks)
         const call = await Call.create({
             userId: req.user._id,
             to: parsedNumber.format('E.164'),
@@ -105,16 +107,27 @@ exports.initiateCall = async(req, res, next) => {
             status: 'initiating',
             country: rate.country,
             countryCode: rate.countryCode,
-            ratePerMinute: rate.ratePerMinute,
-            twilioCallSid: `CA${Math.random().toString(36).substr(2, 32)}`
+            ratePerMinute: rate.ratePerMinute
         });
 
-        // Simulate call progress (in production, Twilio handles this)
-        setTimeout(async() => {
-            call.status = 'ringing';
-            call.startTime = new Date();
-            await call.save();
-        }, 1000);
+        // Build the URL Twilio will request for TwiML when the call is answered
+        // Ensure BASE_URL is configured (publicly reachable, use ngrok in dev)
+        const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 5000}`;
+        const twimlUrl = new URL('/api/calls/twilio/outbound-twiml', baseUrl);
+        twimlUrl.searchParams.set('callId', call._id.toString());
+
+        // Create a real call via Twilio REST API
+        const twilioCall = await client.calls.create({
+            from: call.from,
+            to: call.to,
+            url: twimlUrl.toString(),
+            statusCallback: `${baseUrl}/api/calls/twilio/status?callId=${call._id}`,
+            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
+        });
+
+        // Persist Twilio SID
+        call.twilioCallSid = twilioCall.sid;
+        await call.save();
 
         res.json({
             success: true,
@@ -125,9 +138,116 @@ exports.initiateCall = async(req, res, next) => {
                 from: call.from,
                 estimatedCostPerMinute: rate.ratePerMinute,
                 currency: 'USD',
+                twilioSid: twilioCall.sid,
                 createdAt: call.createdAt
             }
         });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// Twilio will request this endpoint (GET or POST) to fetch TwiML for outbound calls
+exports.outboundTwiml = async(req, res, next) => {
+    try {
+        const { callId } = req.query;
+        const call = callId ? await Call.findById(callId) : null;
+
+        const twiml = new twilio.twiml.VoiceResponse();
+
+        if (call) {
+            // Dial the destination number
+            twiml.dial({ callerId: call.from }, call.to);
+        } else if (req.query.to) {
+            twiml.dial({ callerId: process.env.TWILIO_PHONE_NUMBER }, req.query.to);
+        } else {
+            twiml.say('Unable to find call information.');
+        }
+
+        res.type('text/xml');
+        res.send(twiml.toString());
+    } catch (error) {
+        next(error);
+    }
+};
+
+// Handler for incoming calls from Twilio (webhook). This answers the call with simple TwiML.
+exports.incomingWebhook = async(req, res, next) => {
+    try {
+        // Twilio posts form-encoded body with From, To, CallSid, etc.
+        const { From, To, CallSid } = req.body || req.query || {};
+
+        // Try to find a user who owns the destination 'To' phone number
+        let targetUser = null;
+        try {
+            let parsedTo;
+            try {
+                parsedTo = parsePhoneNumber(To);
+            } catch (e) {
+                parsedTo = null;
+            }
+
+            if (parsedTo && parsedTo.isValid && parsedTo.isValid()) {
+                const formatted = parsedTo.format('E.164');
+                targetUser = await User.findOne({ phone: formatted });
+            }
+
+            if (!targetUser) {
+                targetUser = await User.findOne({ phone: To });
+            }
+        } catch (e) {
+            console.warn('Error matching incoming To to a user', e);
+        }
+
+        // Create a call record for tracking, attach userId when possible
+        const call = await Call.create({
+            userId: targetUser ? targetUser._id : null,
+            to: To,
+            from: From,
+            status: 'incoming',
+            twilioCallSid: CallSid
+        });
+
+        const twiml = new twilio.twiml.VoiceResponse();
+
+        if (targetUser) {
+            // Route incoming PSTN call to the web client identity (user._id)
+            const dial = twiml.dial();
+            dial.client(targetUser._id.toString());
+        } else {
+            // If no matching user, reply with a greeting then hang up
+            twiml.say('Hello, you have reached the Phonely demo. Please wait while we connect your call.');
+            twiml.hangup();
+        }
+
+        res.type('text/xml');
+        res.send(twiml.toString());
+    } catch (error) {
+        next(error);
+    }
+};
+
+// Twilio status callbacks (updates call state)
+exports.statusCallback = async(req, res, next) => {
+    try {
+        // Twilio sends status updates as form-encoded POSTs
+        const { CallStatus, CallSid } = req.body || {};
+        const callId = req.query.callId;
+
+        // Try to update by Twilio SID first, then by local id
+        let call = null;
+        if (CallSid) call = await Call.findOne({ twilioCallSid: CallSid });
+        if (!call && callId) call = await Call.findById(callId);
+
+        if (call) {
+            call.status = CallStatus || call.status;
+            if (CallStatus === 'in-progress' && !call.startTime) call.startTime = new Date();
+            if ((CallStatus === 'completed' || CallStatus === 'canceled') && !call.endTime) call.endTime = new Date();
+            await call.save();
+        }
+
+        // Respond 200 to Twilio
+        res.sendStatus(200);
     } catch (error) {
         next(error);
     }

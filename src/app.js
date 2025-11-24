@@ -14,14 +14,17 @@ const errorHandler = require('./middleware/errorHandler');
 
 const app = express();
 
+// Trust proxy headers (needed for correct client IP detection behind proxies like ngrok, Heroku, etc.)
+// See: https://express-rate-limit.github.io/ERR_ERL_UNEXPECTED_X_FORWARDED_FOR/
+app.set('trust proxy', 1);
+
 // Security middleware
 app.use(helmet());
 
 // CORS - Allow multiple origins for development
 const defaultOrigins = ['http://localhost:8080', 'http://localhost:5173', 'http://localhost:3000'];
-const envOrigins = process.env.CORS_ORIGIN 
-    ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim())
-    : [];
+const envOrigins = process.env.CORS_ORIGIN ?
+    process.env.CORS_ORIGIN.split(',').map(origin => origin.trim()) : [];
 
 // Merge environment origins with defaults, ensuring localhost:8080 is always included
 const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
@@ -29,15 +32,15 @@ const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
 const isDevelopment = process.env.NODE_ENV !== 'production';
 
 app.use(cors({
-    origin: function (origin, callback) {
+    origin: function(origin, callback) {
         // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
-        
+
         // In development, allow all origins for flexibility
         if (isDevelopment) {
             return callback(null, true);
         }
-        
+
         // In production, only allow specified origins
         if (allowedOrigins.indexOf(origin) !== -1) {
             callback(null, true);
@@ -61,6 +64,13 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), requi
 // Body parser (after Stripe webhook)
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Twilio webhooks - these must be public endpoints but are validated by Twilio signature
+// They expect application/x-www-form-urlencoded bodies from Twilio
+const verifyTwilio = require('./middleware/verifyTwilio');
+app.post('/api/calls/twilio/incoming', express.urlencoded({ extended: true }), verifyTwilio, require('./controllers/callController').incomingWebhook);
+app.post('/api/calls/twilio/status', express.urlencoded({ extended: true }), verifyTwilio, require('./controllers/callController').statusCallback);
+app.all('/api/calls/twilio/outbound-twiml', express.urlencoded({ extended: true }), verifyTwilio, require('./controllers/callController').outboundTwiml);
 
 // API Routes
 app.use('/api/auth', authRoutes);

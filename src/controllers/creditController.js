@@ -45,8 +45,9 @@ const CREDIT_PACKAGES = [{
 
 exports.getBalance = async(req, res, next) => {
     try {
-        // Fetch recent transactions for the user
+        // Fetch recent transactions for the user - optimize query
         const transactions = await Transaction.find({ userId: req.user._id })
+            .select('type amount creditAmount description createdAt status')
             .sort({ createdAt: -1 })
             .limit(20)
             .lean();

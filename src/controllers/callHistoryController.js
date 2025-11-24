@@ -41,28 +41,48 @@ exports.getCallHistory = async(req, res, next) => {
         const sortOption = {
             [sortBy]: sortOrder === 'desc' ? -1 : 1 };
 
+        // Optimize query - only fetch needed fields and limit results
+        const limitValue = Math.min(parseInt(limit) || 20, 100); // Max 100 records per request
+        
+        // Only get count if we're on the first page or need pagination
+        const needsCount = parseInt(page) === 1 || parseInt(limit) < 100;
+        
         const [calls, total] = await Promise.all([
             Call.find(filter)
+            .select('to from contactName status startTime endTime duration cost country countryCode createdAt')
             .sort(sortOption)
             .skip(skip)
-            .limit(parseInt(limit))
+            .limit(limitValue)
             .lean(),
-            Call.countDocuments(filter)
+            needsCount ? Call.countDocuments(filter) : Promise.resolve(0)
         ]);
 
-        // Enrich with contact names
-        const phoneNumbers = calls.map(c => c.to);
-        const contacts = await Contact.find({
-            userId: req.user._id,
-            phoneNumber: { $in: phoneNumbers }
-        }).lean();
+        // Enrich with contact names only if we have calls and phone numbers
+        // Skip if calls already have contactName populated or if no calls
+        let enrichedCalls = calls;
+        if (calls.length > 0) {
+            // Only lookup contacts if we don't already have contact names
+            const needsContactLookup = calls.some(c => !c.contactName);
+            
+            if (needsContactLookup) {
+                const phoneNumbers = [...new Set(calls.map(c => c.to).filter(Boolean))]; // Deduplicate and filter nulls
+                if (phoneNumbers.length > 0) {
+                    const contacts = await Contact.find({
+                        userId: req.user._id,
+                        phoneNumber: { $in: phoneNumbers }
+                    })
+                    .select('phoneNumber name')
+                    .lean();
 
-        const contactMap = new Map(contacts.map(c => [c.phoneNumber, c.name]));
+                    const contactMap = new Map(contacts.map(c => [c.phoneNumber, c.name]));
 
-        const enrichedCalls = calls.map(call => ({
-            ...call,
-            contactName: contactMap.get(call.to) || null
-        }));
+                    enrichedCalls = calls.map(call => ({
+                        ...call,
+                        contactName: call.contactName || contactMap.get(call.to) || null
+                    }));
+                }
+            }
+        }
 
         res.json({
             success: true,
